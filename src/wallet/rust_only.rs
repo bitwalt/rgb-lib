@@ -367,6 +367,171 @@ impl Wallet {
         ))
     }
 
+    /// Record the RGB-side party's leg of an on-chain swap transfer as `Settled` in this
+    /// wallet's local bookkeeping, so `list_unspents`/`get_asset_balance`/`refresh` reflect it.
+    ///
+    /// `color_psbt`/`color_psbt_and_consume` only update the RGB stash/runtime — they never
+    /// touch the SQL-backed transfer history that `list_unspents` and friends actually read
+    /// from, because that bookkeeping is otherwise only written by `send_end`, which can't
+    /// build a PSBT spending a second party's UTXO. This fills that gap for a transfer built by
+    /// hand instead (see `rgb-onchain-swaps-atomic`). Call once the swap transaction has
+    /// broadcast and confirmed.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn record_swap_send(
+        &self,
+        txid: String,
+        contract_id: ContractId,
+        spent_outpoint: Outpoint,
+        sent_amount: u64,
+        recipient_id: String,
+        min_confirmations: u8,
+    ) -> Result<i32, Error> {
+        info!(self.logger, "Recording swap send...");
+        let created_at = now().unix_timestamp();
+
+        let batch_transfer = DbBatchTransferActMod {
+            txid: ActiveValue::Set(Some(txid.clone())),
+            status: ActiveValue::Set(TransferStatus::Settled),
+            expiration: ActiveValue::Set(None),
+            created_at: ActiveValue::Set(created_at),
+            min_confirmations: ActiveValue::Set(min_confirmations),
+            ..Default::default()
+        };
+        let batch_transfer_idx = self.database.set_batch_transfer(batch_transfer)?;
+
+        let spent_txo = self
+            .database
+            .get_txo(&spent_outpoint)?
+            .ok_or_else(|| Error::UnknownTxo {
+                outpoint: spent_outpoint.to_string(),
+            })?;
+
+        // The normal broadcast path (`_broadcast_psbt`) is what marks a
+        // spent input's TXO as `spent` in the DB — `broadcast_swap_tx`
+        // bypasses it entirely (it's a raw indexer broadcast), so without
+        // this the wallet would still count this allocation as unspent.
+        let mut spent_txo_update: DbTxoActMod = spent_txo.clone().into();
+        spent_txo_update.spent = ActiveValue::Set(true);
+        self.database.update_txo(spent_txo_update)?;
+
+        let asset_transfer = DbAssetTransferActMod {
+            user_driven: ActiveValue::Set(true),
+            batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
+            asset_id: ActiveValue::Set(Some(contract_id.to_string())),
+            ..Default::default()
+        };
+        let asset_transfer_idx = self.database.set_asset_transfer(asset_transfer)?;
+
+        let db_coloring = DbColoringActMod {
+            txo_idx: ActiveValue::Set(spent_txo.idx),
+            asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+            r#type: ActiveValue::Set(ColoringType::Input),
+            assignment: ActiveValue::Set(Assignment::Fungible(sent_amount)),
+            ..Default::default()
+        };
+        self.database.set_coloring(db_coloring)?;
+
+        let transfer = DbTransferActMod {
+            asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+            requested_assignment: ActiveValue::Set(Some(Assignment::Fungible(sent_amount))),
+            incoming: ActiveValue::Set(false),
+            recipient_id: ActiveValue::Set(Some(recipient_id)),
+            ..Default::default()
+        };
+        self.database.set_transfer(transfer)?;
+
+        info!(self.logger, "Record swap send completed");
+        Ok(batch_transfer_idx)
+    }
+
+    /// Record the BTC-side party's leg of an on-chain swap transfer (the incoming RGB
+    /// allocation) as `Settled`. Call after `accept_transfer` (which updates the RGB stash) and
+    /// `save_new_asset` (if the asset was previously unknown to this wallet), to also make
+    /// `list_unspents`/`get_asset_balance`/`refresh` reflect it. See `record_swap_send` for why
+    /// this bookkeeping doesn't happen automatically for a swap-constructed transfer.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn record_swap_receive(
+        &self,
+        txid: String,
+        vout: u32,
+        contract_id: ContractId,
+        received_amount: u64,
+        btc_amount: u64,
+        recipient_id: String,
+        min_confirmations: u8,
+    ) -> Result<i32, Error> {
+        info!(self.logger, "Recording swap receive...");
+        let created_at = now().unix_timestamp();
+
+        let batch_transfer = DbBatchTransferActMod {
+            txid: ActiveValue::Set(Some(txid.clone())),
+            status: ActiveValue::Set(TransferStatus::Settled),
+            expiration: ActiveValue::Set(None),
+            created_at: ActiveValue::Set(created_at),
+            min_confirmations: ActiveValue::Set(min_confirmations),
+            ..Default::default()
+        };
+        let batch_transfer_idx = self.database.set_batch_transfer(batch_transfer)?;
+
+        let outpoint = Outpoint {
+            txid: txid.clone(),
+            vout,
+        };
+        let txo_idx = match self.database.get_txo(&outpoint)? {
+            Some(txo) => txo.idx,
+            None => {
+                let db_utxo = DbTxoActMod {
+                    txid: ActiveValue::Set(txid.clone()),
+                    vout: ActiveValue::Set(vout),
+                    btc_amount: ActiveValue::Set(btc_amount.to_string()),
+                    spent: ActiveValue::Set(false),
+                    exists: ActiveValue::Set(false),
+                    pending_witness: ActiveValue::Set(false),
+                    ..Default::default()
+                };
+                self.database.set_txo(db_utxo)?
+            }
+        };
+
+        let asset_transfer = DbAssetTransferActMod {
+            user_driven: ActiveValue::Set(true),
+            batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
+            asset_id: ActiveValue::Set(Some(contract_id.to_string())),
+            ..Default::default()
+        };
+        let asset_transfer_idx = self.database.set_asset_transfer(asset_transfer)?;
+
+        let db_coloring = DbColoringActMod {
+            txo_idx: ActiveValue::Set(txo_idx),
+            asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+            r#type: ActiveValue::Set(ColoringType::Receive),
+            assignment: ActiveValue::Set(Assignment::Fungible(received_amount)),
+            ..Default::default()
+        };
+        self.database.set_coloring(db_coloring)?;
+
+        let transfer = DbTransferActMod {
+            asset_transfer_idx: ActiveValue::Set(asset_transfer_idx),
+            requested_assignment: ActiveValue::Set(Some(Assignment::Fungible(received_amount))),
+            incoming: ActiveValue::Set(true),
+            recipient_id: ActiveValue::Set(Some(recipient_id)),
+            // `get_transfer_data` unconditionally unwraps this for any
+            // incoming, non-`Issue` transfer — the colored output is a
+            // plain transaction output, not a blinded UTXO, so `Witness` is
+            // the correct variant.
+            recipient_type: ActiveValue::Set(Some(RecipientTypeFull::Witness { vout: Some(vout) })),
+            ..Default::default()
+        };
+        self.database.set_transfer(transfer)?;
+
+        info!(self.logger, "Record swap receive completed");
+        Ok(batch_transfer_idx)
+    }
+
     /// Consume an RGB fascia.
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use

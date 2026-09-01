@@ -445,6 +445,13 @@ pub enum Error {
         txid: String,
     },
 
+    /// The given outpoint has no tracked TXO in this wallet
+    #[error("Unknown TXO for outpoint: {outpoint}")]
+    UnknownTxo {
+        /// The outpoint that was looked up
+        outpoint: String,
+    },
+
     /// The backup version is not supported
     #[error("Backup version not supported")]
     UnsupportedBackupVersion {
